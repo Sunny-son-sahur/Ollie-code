@@ -33,13 +33,13 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          mkdir -p release-assets
+          mkdir -p "$GITHUB_WORKSPACE/release-assets"
           cd packages/cli/dist
           for d in cli-*; do
             [ -d "$d" ] || continue
-            zip -qr "../release-assets/${d}.zip" "$d"
+            zip -qr "$GITHUB_WORKSPACE/release-assets/${d}.zip" "$d"
           done
-          ls -lh ../release-assets
+          ls -lh "$GITHUB_WORKSPACE/release-assets"
 
       - name: Create release
         env:
