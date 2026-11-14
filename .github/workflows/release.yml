@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Build all targets
+        run: bun run --cwd packages/cli build --outdir=dist
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cd packages/cli/dist
+          for d in cli-*; do
+            [ -d "$d" ] || continue
+            zip -qr "../release-assets/${d}.zip" "$d"
+          done
+          ls -lh ../release-assets
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Ollie-code $GITHUB_REF_NAME" \
+            --generate-notes
