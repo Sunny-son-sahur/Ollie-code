@@ -1,0 +1,166 @@
+import { defineConfig } from "electron-vite"
+import type { Plugin } from "vite"
+import { BetaNotes } from "./script/beta-notes"
+import { pickerPlugin } from "./script/picker"
+import { nodePtyPackage } from "./script/utils"
+
+function resolveChannel() {
+  const raw = process.env.OPENCODE_CHANNEL
+
+  if (raw === "local" || raw === "dev" || raw === "beta" || raw === "prod") return raw
+
+  if (raw === "latest") return "prod"
+
+  // olliEcode: default to "local" so desktop User-Agent matches the standalone
+  // CLI (which also defaults to "local" via packages/cli/src/version.ts).
+  return "local"
+}
+
+const appPlugin = (await import("@opencode/app/vite")).default
+
+// Every module the entry reaches through static imports lands in one chunk. Automatic splitting
+// otherwise fragments the initial graph into ~50 files shared with lazy routes, and each file costs
+// the renderer a main-thread request round trip through the main process before first paint.
+// Rolldown hands every chunk-name call a fresh context, so the graph is walked once per output.
+const initialGraph = new Set<string>()
+
+const initialChunk: Plugin = {
+  name: "opencode-desktop:initial-chunk",
+  renderStart() {
+    const entries = [...this.getModuleIds()].filter((id) => this.getModuleInfo(id)?.isEntry)
+    initialGraph.clear()
+    entries.forEach((id) => initialGraph.add(id))
+
+    // A Set's iterator also visits members added while iterating, so this reaches every static import.
+    for (const id of initialGraph) this.getModuleInfo(id)?.importedIds.forEach((imported) => initialGraph.add(imported))
+  },
+}
+
+export default defineConfig(async ({ command }) => {
+  const channel = resolveChannel()
+  const nodePtyPkg = nodePtyPackage()
+
+  // Beta builds carry their commit and recent history for the updater's "What's new in beta"; the dev server carries
+  // them without asking GitHub, so the page can be tried; other channels none.
+  const betaNotes =
+    channel === "beta"
+      ? await BetaNotes.enrich(BetaNotes.embed(), { token: process.env.GITHUB_TOKEN })
+      : command === "serve"
+        ? BetaNotes.embed()
+        : undefined
+
+  return {
+    main: {
+      resolve: {
+        dedupe: ["effect"],
+      },
+      define: {
+        // olliEcode: do NOT coerce "local" to "dev" here. The upstream mapping
+        // was done so Dev-channel branding + updater applied to local builds,
+        // but it also sent User-Agent `opencode/dev/...` which opencode.ai
+        // rate-limits more aggressively than `opencode/local/...` (the TUI's
+        // UA from the same source tree). Keeping the raw channel string makes
+        // the desktop's User-Agent match the TUI's bucket at opencode.ai.
+        "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel),
+        // olliEcode licensing: Ed25519 SPKI pubkey, base64-encoded. Same env
+        // var the CLI build reads (see scripts/sync.sh patch_file injecting
+        // it into upstream/packages/cli/script/build.ts), so one secret
+        // flows into both artifacts. Dev builds without the env var fall
+        // through to the "dev-pubkey-replace" sentinel which fails verify.
+        OLLIECODE_LICENSE_PUBKEY: JSON.stringify(
+          (process.env.OLLIECODE_LICENSE_PUBKEY ?? "dev-pubkey-replace").replace(/\s+/g, ""),
+        ),
+        // Same salt the CLI build reads; must match so cache files encrypted
+        // by one artifact decrypt in the other on the same HWID.
+        OLLIECODE_CACHE_SALT: JSON.stringify(
+          process.env.OLLIECODE_CACHE_SALT ?? "dev-cache-salt-replace",
+        ),
+      },
+      build: {
+        minify: command === "build",
+        rolldownOptions: {
+          input: { index: "src/main/index.ts" },
+          output: {
+            format: "es",
+            // DesktopPaths resolves resources from the main output directory,
+            // including when the lazy desktop entry shares it with other chunks.
+            chunkFileNames: "[name]-[hash].js",
+          },
+        },
+        externalizeDeps: {
+          // Bundle the Effect family together.
+          exclude: ["effect", "@effect/platform-node", "@effect/platform-node-shared", "drizzle-orm"],
+          include: [nodePtyPkg],
+        },
+      },
+      plugins: [
+        {
+          name: "opencode:node-pty-narrower",
+          enforce: "pre",
+          resolveId(s) {
+            if (s === "@lydell/node-pty") return nodePtyPkg
+
+            return undefined
+          },
+        },
+        {
+          // Rolldown emits its own scoped createRequire runtime for CommonJS dependencies.
+          // electron-vite's post-bundle regex shim injects a top-level `const require` that collides
+          // with bundled ESM modules declaring their own `require` (such as @effect/platform-node).
+          name: "opencode:disable-esm-shim",
+          configResolved(config) {
+            const shim = config.plugins.find((plugin) => plugin.name === "vite:esm-shim")
+
+            if (shim) delete shim.renderChunk
+          },
+        },
+      ],
+    },
+    preload: {
+      build: {
+        minify: command === "build",
+        rolldownOptions: {
+          input: { index: "src/preload/index.ts" },
+          output: {
+            format: "cjs",
+            // The package is "type": "module". Under --no-sandbox Electron loads the preload
+            // through Node's module loader, which treats a .js file as ESM and fails on
+            // require("electron"). The sandboxed path ignores the extension.
+            entryFileNames: "[name].cjs",
+          },
+        },
+      },
+    },
+    renderer: {
+      experimental: {
+        bundledDev: true,
+      },
+      define: {
+        "import.meta.env.OPENCODE_VERSION": JSON.stringify(process.env.OPENCODE_VERSION),
+        "import.meta.env.VITE_OPENCODE_CHANNEL": JSON.stringify(channel),
+        "import.meta.env.OPENCODE_COMMIT": betaNotes ? JSON.stringify(betaNotes.sha) : "undefined",
+        "import.meta.env.OPENCODE_BETA_NOTES": betaNotes ? JSON.stringify(JSON.stringify(betaNotes)) : "undefined",
+        "import.meta.env.OPENCODE_TEST_ONBOARDING": JSON.stringify(
+          command === "serve" && process.env.OPENCODE_TEST_ONBOARDING === "1",
+        ),
+      },
+      plugins: [pickerPlugin(), appPlugin, initialChunk],
+      publicDir: "../../../app/public",
+      root: "src/renderer",
+      build: {
+        minify: command === "build",
+        sourcemap: true,
+        rolldownOptions: {
+          input: {
+            main: "src/renderer/index.html",
+          },
+          output: {
+            codeSplitting: {
+              groups: [{ name: (id) => (initialGraph.has(id) ? "app" : null), priority: 10 }],
+            },
+          },
+        },
+      },
+    },
+  }
+})

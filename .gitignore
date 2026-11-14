@@ -1,0 +1,13 @@
+﻿node_modules/
+dist/
+out/
+.cache/
+.turbo/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+.env
+.secrets/
+*.zip
