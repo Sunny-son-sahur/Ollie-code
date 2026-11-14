@@ -212,7 +212,7 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
     },
     define: {
       OPENCODE_VERSION: `'${Script.version}'`,
-      OPENCODE_CLI_NAME: "'opencode'",
+      OPENCODE_CLI_NAME: "'olliEcode'",
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_ARTIFACT: `'cli'`,
       OLLIECODE_LICENSE_PUBKEY: `'${(process.env.OLLIECODE_LICENSE_PUBKEY ?? "dev-pubkey-replace").replace(/\s+/g, "")}'`,

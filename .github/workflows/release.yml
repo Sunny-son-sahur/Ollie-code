@@ -8,8 +8,10 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  cli:
     runs-on: ubuntu-latest
+    env:
+      OPENCODE_CHANNEL: local
     steps:
       - uses: actions/checkout@v4
 
@@ -24,10 +26,14 @@ jobs:
           key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: bun-${{ runner.os }}-
 
+      - name: Version from tag
+        shell: bash
+        run: echo "OPENCODE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Install
         run: bun install --frozen-lockfile
 
-      - name: Build all targets
+      - name: Build all cli targets
         run: bun run --cwd packages/cli build --outdir=dist
 
       - name: Free disk for packaging
@@ -37,7 +43,7 @@ jobs:
           find packages services -maxdepth 3 -name node_modules -type d -exec rm -rf {} + 2>/dev/null || true
           df -h /
 
-      - name: Package
+      - name: Package cli zips
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/release-assets"
@@ -54,7 +60,146 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Ollie-code $GITHUB_REF_NAME" \
-            --generate-notes
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Ollie-code $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+  desktop-linux:
+    needs: cli
+    runs-on: ubuntu-latest
+    env:
+      OPENCODE_CHANNEL: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Cache electron
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.cache/electron-builder
+          key: electron-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Version from tag
+        shell: bash
+        run: echo "OPENCODE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Build cli for the desktop bundle
+        env:
+          OPENCODE_TARGET: linux-x64-baseline
+        run: bun run --cwd packages/cli build --outdir=dist
+
+      - name: Build desktop app
+        env:
+          OPENCODE_TARGET: linux-x64
+        run: bun run --cwd packages/desktop build
+
+      - name: Install rpm tooling
+        run: sudo apt-get update -q && sudo apt-get install -y -q rpm
+
+      - name: Pack desktop
+        env:
+          OPENCODE_TARGET: linux-x64
+        run: bun run --cwd packages/desktop pack
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -lh dist/desktop
+          gh release upload "$GITHUB_REF_NAME" dist/desktop/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  desktop-windows:
+    needs: cli
+    runs-on: windows-latest
+    env:
+      OPENCODE_CHANNEL: local
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Cache bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Cache electron
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Version from tag
+        run: echo "OPENCODE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Build cli for the desktop bundle
+        env:
+          OPENCODE_TARGET: windows-x64-baseline
+        run: bun run --cwd packages/cli build --outdir=dist
+
+      - name: Build desktop app
+        env:
+          OPENCODE_TARGET: windows-x64
+        run: bun run --cwd packages/desktop build
+
+      - name: Pack desktop (unpacked app)
+        env:
+          OPENCODE_TARGET: windows-x64
+        run: bun run --cwd packages/desktop pack
+
+      # pack.ts wipes packages/desktop/dist and dist/desktop on every run, so
+      # the unpacked app moves out before the second pass builds the NSIS
+      # installer around it with --prepackaged. cygpath translates the staged
+      # path to native Windows form for bun/electron-builder.
+      - name: Stage unpacked app
+        run: |
+          set -euo pipefail
+          mv dist/desktop/app ./win-app-staged
+          echo "OPENCODE_DESKTOP_APP=$(cygpath -w "$PWD/win-app-staged")" >> "$GITHUB_ENV"
+          ls ./win-app-staged | head
+
+      - name: Pack NSIS installer
+        env:
+          OPENCODE_TARGET: windows-x64
+        run: bun run --cwd packages/desktop pack
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -lh dist/desktop
+          gh release upload "$GITHUB_REF_NAME" dist/desktop/*.exe \
+            --repo "$GITHUB_REPOSITORY" --clobber
