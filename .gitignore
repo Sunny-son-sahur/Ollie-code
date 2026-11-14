@@ -4,6 +4,7 @@ out/
 .cache/
 .turbo/
 *.log
+*.tsbuildinfo
 *.db
 *.db-shm
 *.db-wal

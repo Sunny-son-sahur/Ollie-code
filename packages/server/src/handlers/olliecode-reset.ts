@@ -209,11 +209,15 @@ export const OlliecodeResetLayer = HttpRouter.use((router) =>
         // we escape single quotes manually (POSIX path chars don't need
         // more). The dir is server-chosen, never user input.
         const escaped = dest.replace(/'/g, "''")
-        try {
-          yield* service.db.run(sql.raw(`VACUUM INTO '${escaped}'`))
-        } catch (e) {
+        // Effect failures do not pass through a JS try/catch around yield*;
+        // unwrap the result explicitly so this route's error union stays
+        // clean (a bare yield leaks EffectDrizzleQueryError into the
+        // router's Request<"Error", …> marker and out of ServerProcess).
+        const vacuum = yield* Effect.result(service.db.run(sql.raw(`VACUUM INTO '${escaped}'`)))
+        if (vacuum._tag === "Failure") {
+          const msg = vacuum.failure instanceof Error ? vacuum.failure.message : String(vacuum.failure)
           return HttpServerResponse.jsonUnsafe(
-            { ok: false, error: `vacuum failed: ${(e as Error).message}` },
+            { ok: false, error: `vacuum failed: ${msg}` },
             { status: 500 },
           )
         }
@@ -232,11 +236,8 @@ export const OlliecodeResetLayer = HttpRouter.use((router) =>
         const url = new URL(request.url, "http://localhost")
         const mode = url.searchParams.get("mode")
         const deep = url.searchParams.get("deep") === "1" || mode === "fresh"
-        // Preserve defaults to 0 (full wipe, no session carry-over). Explicit
-        // preserve=1 re-enables the snapshot + reinsert blocks; everything
-        // else in the fresh ritual (fingerprint rotate, WARP rotate, credential
-        // wipe, sidecar exit) runs identically both ways.
-        const preserveSessions = url.searchParams.get("preserve") === "1"
+        // `preserve=1` is accepted but inert since v17: the snapshot +
+        // reinsert blocks it gated were retired with the in-process path.
 
         // Server-authoritative gate for EVERY reset path, including the
         // default counter wipe. A cached license is not enough: the Worker
@@ -867,7 +868,9 @@ type WarpOutcome =
   | { status: "skipped"; reason: string }
   | { status: "failed"; step: string; error: string; ip_before?: string | null }
 
-function rotateWarp(): Effect.Effect<WarpOutcome & { warp_cycle?: WarpCycleOutcome }> {
+// Retired in-process path kept exported for reference (see the v17 notes
+// in the reset handler above); nothing calls it anymore.
+export function rotateWarp(): Effect.Effect<WarpOutcome & { warp_cycle?: WarpCycleOutcome }> {
   return Effect.promise(async (): Promise<WarpOutcome & { warp_cycle?: WarpCycleOutcome }> => {
     // Run Tor rotation and WARP rotation IN PARALLEL. Each shifts a
     // different layer of identity:
@@ -1064,7 +1067,7 @@ async function doWarpCycle(): Promise<WarpCycleOutcome> {
 // Row shape for dynamic snapshot/reinsert of session state. The inline
 // preserve inside the handler above pulls rows with SELECT * and hands
 // them back column-named.
-type Row = Record<string, unknown>
+export type Row = Record<string, unknown>
 
 // Generate a fresh ID matching opencode's own Identifier format:
 // prefix + 12 hex (timestamp) + 14 base62. Vendor schema validators check
@@ -1077,7 +1080,7 @@ type Row = Record<string, unknown>
 const _ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 let _idCounter = 0
 let _idLastTs = 0
-function mintId(oldId: string, fallbackPrefix: string): string {
+export function mintId(oldId: string, fallbackPrefix: string): string {
   const m = /^([a-z]{2,8}_)/.exec(oldId)
   const prefix = m ? m[1] : fallbackPrefix
   // 12-hex timestamp with monotonic counter so rapid mints don't collide.
