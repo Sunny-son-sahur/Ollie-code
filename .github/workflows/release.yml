@@ -30,6 +30,13 @@ jobs:
       - name: Build all targets
         run: bun run --cwd packages/cli build --outdir=dist
 
+      - name: Free disk for packaging
+        run: |
+          df -h /
+          rm -rf node_modules
+          find packages services -maxdepth 3 -name node_modules -type d -exec rm -rf {} + 2>/dev/null || true
+          df -h /
+
       - name: Package
         run: |
           set -euo pipefail
@@ -38,8 +45,10 @@ jobs:
           for d in cli-*; do
             [ -d "$d" ] || continue
             zip -qr "$GITHUB_WORKSPACE/release-assets/${d}.zip" "$d"
+            rm -rf "$d"
           done
           ls -lh "$GITHUB_WORKSPACE/release-assets"
+          df -h /
 
       - name: Create release
         env:
