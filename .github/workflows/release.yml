@@ -15,6 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Reclaim the preinstalled toolchains first: the all-target build needs
+      # the headroom before install, not after it.
+      - name: Free disk before build
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -76,6 +84,12 @@ jobs:
       OPENCODE_CHANNEL: local
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk before build
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: oven-sh/setup-bun@v2
         with:

@@ -13,6 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The runner ships ~14 GB free; the all-target CLI build plus node_modules
+      # overflows it mid-build (the diag log itself failed to write). Reclaim
+      # the preinstalled toolchains before anything installs.
+      - name: Free disk before build
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
