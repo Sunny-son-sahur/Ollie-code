@@ -24,6 +24,11 @@ const appNames: Record<string, string> = {
 }
 
 const appIDs: Record<string, string> = {
+  // local reuses the dev identity: electron-builder.config resolveChannel maps
+  // local -> dev, so the packaged appId, .desktop filename and WM_CLASS are all
+  // dev's. A missing local key made APP_ID undefined in packaged builds and
+  // crashed path.join(appData, undefined) before ready.
+  local: "ai.opencode.desktop.dev",
   dev: "ai.opencode.desktop.dev",
   beta: "ai.opencode.desktop.beta",
   prod: "ai.opencode.desktop",
