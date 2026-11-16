@@ -19,7 +19,7 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs"
 import { createConnection as netConnect } from "node:net"
 import { homedir } from "node:os"
 import { dirname as pathDirname, join as pathJoin } from "node:path"
-import { installImpersonateFetchOverride } from "./olliecode-impersonate-fetch.js"
+import { installFreeLimitFallbackOverride, installImpersonateFetchOverride } from "./olliecode-impersonate-fetch.js"
 
 const TOR_SOCKS_PORT = 9150
 
@@ -228,12 +228,20 @@ async function torFetch(input: RequestInfo | URL, init?: RequestInit): Promise<R
 // flag, so Tor NEWNYM + Chrome JA3 stack additively.
 //
 // Installed unconditionally. If the binary is missing (dev build, stripped
-// installer), installImpersonateFetchOverride returns {installed:false}
-// and this call is a no-op — native fetch keeps working for every host.
+// installer, Linux packages — resolveImpersonateBin only looks for the .exe),
+// installImpersonateFetchOverride returns {installed:false} and we fall back
+// to installFreeLimitFallbackOverride: a native-fetch override that keeps the
+// same 429 FreeUsageLimit -> fallback chain (deepseek key -> relay ->
+// pollinations) without the subprocess. Without it the raw 429 reaches the
+// AI SDK and the user sees "Free limit reached" with nothing behind it.
 ;(function patchImpersonate() {
   try {
     const result = installImpersonateFetchOverride()
     diag(`[bootstrap-impersonate] install result: ${JSON.stringify(result)}`)
+    if (!result.installed) {
+      const fb = installFreeLimitFallbackOverride()
+      diag(`[bootstrap-impersonate] native fallback override: ${JSON.stringify(fb)}`)
+    }
   } catch (e) {
     diag(`[bootstrap-impersonate] FAILED: ${(e as Error).message}`)
   }

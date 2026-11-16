@@ -680,8 +680,20 @@ export function requestHasImage(body: Buffer | null) {
 // usable body); callers then keep the original response.
 const installId = () => createHash("sha256").update(`${homedir()}|${hostname()}`).digest("hex").slice(0, 32)
 
+// How the fallback chain sends one request. The impersonate path shells out
+// to curl-impersonate; the native path (no binary on this platform) uses the
+// real fetch. Both are constructed with allowFallback=false semantics — the
+// fallback never re-enters itself.
+type FallbackTransport = (
+  url: string,
+  method: string,
+  headerPairs: [string, string][],
+  body: Buffer | null,
+  timeoutMs: number,
+) => Promise<Response>
+
 async function fallbackResponse(
-  bin: string,
+  send: FallbackTransport,
   url: string,
   body: Buffer | null,
   profile: Profile,
@@ -698,8 +710,7 @@ async function fallbackResponse(
     if (rewrite) {
       try {
         diag(`[fallback] free limit on ${url.slice(0, 120)} -> deepseek`)
-        const response = await impersonateFetchViaSubprocess(
-          bin,
+        const response = await send(
           "https://api.deepseek.com/chat/completions",
           "POST",
           [
@@ -707,7 +718,6 @@ async function fallbackResponse(
             ["authorization", `Bearer ${key}`],
           ],
           Buffer.from(rewrite, "utf8"),
-          false,
           90_000,
         )
         diag(`[fallback] deepseek status=${response.status} type=${response.headers.get("content-type") || "n/a"}`)
@@ -723,8 +733,7 @@ async function fallbackResponse(
   if (relayBody) {
     try {
       diag(`[fallback] relay -> ${relayUrl}`)
-      const response = await impersonateFetchViaSubprocess(
-        bin,
+      const response = await send(
         relayUrl,
         "POST",
         [
@@ -732,7 +741,6 @@ async function fallbackResponse(
           ["x-user-install", installId()],
         ],
         Buffer.from(relayBody, "utf8"),
-        false,
         90_000,
       )
       diag(`[fallback] relay status=${response.status} type=${response.headers.get("content-type") || "n/a"}`)
@@ -755,15 +763,7 @@ async function fallbackResponse(
       let lastHeaders = new Headers()
       let lastText = ""
       for (let attempt = 0; attempt < 4; attempt++) {
-        const response = await impersonateFetchViaSubprocess(
-          bin,
-          fallbackUrl,
-          "POST",
-          fbHeaders,
-          Buffer.from(rewrite, "utf8"),
-          false,
-          90_000,
-        )
+        const response = await send(fallbackUrl, "POST", fbHeaders, Buffer.from(rewrite, "utf8"), 90_000)
         diag(
           `[fallback] response status=${response.status} type=${response.headers.get("content-type") || "n/a"} attempt=${attempt + 1}`,
         )
@@ -798,6 +798,7 @@ async function impersonateFetchViaSubprocess(
   timeoutMs = 0,
 ): Promise<Response> {
   const profile = currentProfile()
+  const send: FallbackTransport = (u, m, h, b, t) => impersonateFetchViaSubprocess(bin, u, m, h, b, false, t)
   const chatUrl = /\/chat\/completions(?:\?|$)/.test(url)
   // The opencode.ai free catalog lists its models as text-only, and the free
   // bucket is usually exhausted anyway. An image-bearing request skips the
@@ -807,7 +808,7 @@ async function impersonateFetchViaSubprocess(
   // trip entirely and stream the fallback directly. This runs before curl is
   // spawned, so the first token arrives without the extra 429 latency.
   if (allowFallback && chatUrl && (vision || freeLimitCooling())) {
-    const response = await fallbackResponse(bin, url, body, profile)
+    const response = await fallbackResponse(send, url, body, profile)
     if (response !== undefined) {
       diag(
         `[fallback] ${vision ? "vision route" : "cooldown active"}; routed ${url.slice(0, 120)} without probing opencode.ai`,
@@ -933,7 +934,7 @@ async function impersonateFetchViaSubprocess(
         diag(`[impersonate] 429 body profile=${profile} bytes=${errorBytes} text=${text.replace(/\r?\n/g, "\\n").slice(0, 300)}`)
       }
       if (allowFallback && fallbackEnabled() && isFreeLimit && /\/chat\/completions(?:\?|$)/.test(url)) {
-        const response = await fallbackResponse(bin, url, body, profile)
+        const response = await fallbackResponse(send, url, body, profile)
         if (response !== undefined) return response
       }
       return new Response(text, { status: errorStatus, headers })
@@ -1153,5 +1154,120 @@ export function installImpersonateFetchOverride(): { installed: boolean; reason?
   }) as typeof globalThis.fetch
   ;(globalThis as { __olliecodeImpersonateInstalled?: boolean }).__olliecodeImpersonateInstalled = true
   diag(`[impersonate] global fetch override INSTALLED (opencode.ai hosts routed via curl-impersonate)`)
+  return { installed: true }
+}
+
+// ---------------------------------------------------------------------------
+// Native FreeUsageLimit fallback — used when curl-impersonate is absent.
+// ---------------------------------------------------------------------------
+//
+// Linux packages ship no deps/impersonate/, so installImpersonateFetchOverride
+// declines and the 429 FreeUsageLimit body reaches the AI SDK raw: the user
+// sees "Free limit reached" with nothing behind it. This override keeps the
+// same contract through the real fetch instead of a subprocess — opencode.ai
+// chat completions answered with FreeUsageLimit are served from the fallback
+// chain (deepseek key -> relay -> pollinations), and everything else passes
+// straight through so streaming inference is untouched.
+
+function nativeTransport(original: typeof globalThis.fetch): FallbackTransport {
+  return async (url, method, headerPairs, body, timeoutMs) => {
+    const headers = new Headers()
+    // Mirror the subprocess path: fetch owns content-encoding/content-length/
+    // host, and handing them over manually breaks response decoding.
+    const dropped = new Set(["accept-encoding", "content-length", "host"])
+    for (const [k, v] of headerPairs) {
+      if (dropped.has(k.toLowerCase())) continue
+      headers.set(k, v)
+    }
+    const controller = new AbortController()
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined
+    try {
+      return await original(url, {
+        method,
+        headers,
+        body: (body && body.length > 0 ? body : undefined) as BodyInit | undefined,
+        signal: controller.signal,
+      })
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+}
+
+// Rebuild a buffered response. content-encoding / content-length /
+// transfer-encoding are dropped: the body we already hold is decoded, and
+// leaving them in would make the consumer decode a second time.
+function rebuildBufferedResponse(response: Response, text: string): Response {
+  const headers = new Headers()
+  response.headers.forEach((value, key) => {
+    const k = key.toLowerCase()
+    if (k === "content-length" || k === "content-encoding" || k === "transfer-encoding") return
+    headers.append(key, value)
+  })
+  return new Response(text, { status: response.status, statusText: response.statusText, headers })
+}
+
+export function installFreeLimitFallbackOverride(): { installed: boolean; reason?: string } {
+  if ((globalThis as { __olliecodeFallbackInstalled?: boolean }).__olliecodeFallbackInstalled) {
+    return { installed: true, reason: "already installed" }
+  }
+  if (typeof globalThis.fetch !== "function") return { installed: false, reason: "no native fetch to override" }
+
+  const original = globalThis.fetch.bind(globalThis)
+  const send = nativeTransport(original)
+
+  ;(globalThis as { fetch: typeof globalThis.fetch }).fetch = (async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    try {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url
+      const host = new URL(url).hostname.toLowerCase()
+      if (!isOpencodeHost(host)) return original(input as RequestInfo | URL, init)
+
+      const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase()
+      if (!/\/chat\/completions(?:\?|$)/.test(url)) return original(input as RequestInfo | URL, init)
+
+      const headerPairs = toHeaderPairs(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+      const bodySource =
+        init?.body ??
+        (input instanceof Request && method !== "GET" && method !== "HEAD" ? await input.clone().arrayBuffer() : null)
+      const bodyBuf = await bodyToBuffer(bodySource as BodyInit | null)
+
+      // Same two shortcuts the subprocess path uses: skip the doomed probe
+      // while the bucket is cooling, and skip it for image requests the
+      // text-only free catalog cannot serve anyway.
+      if (requestHasImage(bodyBuf) || freeLimitCooling()) {
+        const warmed = await fallbackResponse(send, url, bodyBuf, currentProfile())
+        if (warmed !== undefined) return warmed
+      }
+
+      const response = await original(url, {
+        method,
+        headers: new Headers(headerPairs),
+        body: (bodyBuf && bodyBuf.length > 0 ? bodyBuf : undefined) as BodyInit | undefined,
+        // Preserve the caller's abort: a Request passed without init carries
+        // its signal on the request, not on an init that doesn't exist.
+        signal: init?.signal ?? (input instanceof Request ? input.signal : undefined),
+      })
+      if (response.status !== 429 && response.status !== 403) return response
+
+      const text = await response.text()
+      if (!/FreeUsageLimit|free usage limit/i.test(text)) return rebuildBufferedResponse(response, text)
+
+      noteFreeLimit(response.headers)
+      diag(`[fallback] native 429 FreeUsageLimit on ${url.slice(0, 120)} bytes=${text.length}`)
+      const fallback = await fallbackResponse(send, url, bodyBuf, currentProfile())
+      if (fallback !== undefined) return fallback
+      return rebuildBufferedResponse(response, text)
+    } catch (e) {
+      diag(`[fallback] native override ERROR, falling through to original: ${(e as Error).message}`)
+      return original(input as RequestInfo | URL, init)
+    }
+  }) as typeof globalThis.fetch
+
+  ;(globalThis as { __olliecodeFallbackInstalled?: boolean }).__olliecodeFallbackInstalled = true
+  diag(`[fallback] native FreeLimit override INSTALLED (opencode.ai chat 429s routed to fallback chain)`)
   return { installed: true }
 }
